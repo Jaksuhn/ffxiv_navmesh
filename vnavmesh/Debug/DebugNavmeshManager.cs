@@ -11,6 +11,7 @@ class DebugNavmeshManager : IDisposable
     private NavmeshManager _manager;
     private FollowPath _path;
     private AsyncMoveRequest _asyncMove;
+    private DTRProvider _dtr;
     private UITree _tree = new();
     private DebugDrawer _dd;
     private DebugGameCollision _coll;
@@ -19,11 +20,12 @@ class DebugNavmeshManager : IDisposable
     private DebugDetourNavmesh? _drawNavmesh;
     private DebugVoxelMap? _debugVoxelMap;
 
-    public DebugNavmeshManager(DebugDrawer dd, DebugGameCollision coll, NavmeshManager manager, FollowPath path, AsyncMoveRequest move)
+    public DebugNavmeshManager(DebugDrawer dd, DebugGameCollision coll, NavmeshManager manager, FollowPath path, AsyncMoveRequest move, DTRProvider dtr)
     {
         _manager = manager;
         _path = path;
         _asyncMove = move;
+        _dtr = dtr;
         _dd = dd;
         _coll = coll;
         _manager.OnNavmeshChanged += OnNavmeshChanged;
@@ -54,8 +56,9 @@ class DebugNavmeshManager : IDisposable
         }
         ImGui.SameLine();
         ImGui.TextUnformatted(_manager.CurrentKey);
+        ImGui.TextUnformatted($"Num pathfinding tasks: {(_manager.PathfindInProgress ? 1 : 0)} in progress, {_manager.NumQueuedPathfindRequests} queued");
 
-        if (_manager.Navmesh == null)
+        if (_manager.Navmesh == null || _manager.Query == null)
             return;
 
         var player = Service.ClientState.LocalPlayer;
@@ -67,8 +70,12 @@ class DebugNavmeshManager : IDisposable
         if (ImGui.Button("Set target to target pos"))
             _target = player?.TargetObject?.Position ?? default;
         ImGui.SameLine();
+        if (ImGui.Button("Set target to flag position"))
+            _target = MapUtils.FlagToPoint(_manager.Query) ?? default;
+        ImGui.SameLine();
         ImGui.TextUnformatted($"Current target: {_target}");
 
+        ImGui.Checkbox("Show mesh status in DTR Bar", ref _dtr.ShowDtrBar);
         ImGui.Checkbox("Allow movement", ref _path.MovementAllowed);
         ImGui.Checkbox("Align camera to movement direction", ref _path.AlignCamera);
         ImGui.Checkbox("Auto load mesh when changing zone", ref _manager.AutoLoad);
@@ -94,25 +101,27 @@ class DebugNavmeshManager : IDisposable
             }
         }
 
-        _manager.Navmesh.Mesh.CalcTileLoc(playerPos.SystemToRecast(), out var playerTileX, out var playerTileZ);
-        _tree.LeafNode($"Player tile: {playerTileX}x{playerTileZ}");
-        _tree.LeafNode($"Player poly: {_manager.Query?.FindNearestMeshPoly(playerPos):X}");
-        _tree.LeafNode($"Target poly: {_manager.Query?.FindNearestMeshPoly(_target):X}");
+        DrawPosition("Player", playerPos);
+        DrawPosition("Target", _target);
+        DrawPosition("Flag", MapUtils.FlagToPoint(_manager.Query) ?? default);
+        DrawPosition("Floor", _manager.Query.FindPointOnFloor(playerPos) ?? default);
 
-        if (_manager.Query != null)
-        {
-            var playerVoxel = _manager.Query.FindNearestVolumeVoxel(playerPos);
-            if (_tree.LeafNode($"Player voxel: {playerVoxel:X}###playervoxel").SelectedOrHovered && playerVoxel != VoxelMap.InvalidVoxel)
-                _debugVoxelMap?.VisualizeVoxel(playerVoxel);
-            var targetVoxel = _manager.Query.FindNearestVolumeVoxel(_target);
-            if (_tree.LeafNode($"Target voxel: {targetVoxel:X}###targetvoxel").SelectedOrHovered && targetVoxel != VoxelMap.InvalidVoxel)
-                _debugVoxelMap?.VisualizeVoxel(targetVoxel);
-        }
-
-        _drawNavmesh ??= new(_manager.Navmesh.Mesh, _manager.Query?.MeshQuery, _tree, _dd);
+        _drawNavmesh ??= new(_manager.Navmesh.Mesh, _manager.Query.MeshQuery, _tree, _dd);
         _drawNavmesh.Draw();
-        _debugVoxelMap ??= new(_manager.Navmesh.Volume, _manager.Query?.VolumeQuery, _tree, _dd);
-        _debugVoxelMap.Draw();
+        if (_manager.Navmesh.Volume != null)
+        {
+            _debugVoxelMap ??= new(_manager.Navmesh.Volume, _manager.Query.VolumeQuery, _tree, _dd);
+            _debugVoxelMap.Draw();
+        }
+    }
+
+    private void DrawPosition(string tag, Vector3 position)
+    {
+        _manager.Navmesh!.Mesh.CalcTileLoc(position.SystemToRecast(), out var tileX, out var tileZ);
+        _tree.LeafNode($"{tag} position: {position:f3}, tile: {tileX}x{tileZ}, poly: {_manager.Query!.FindNearestMeshPoly(position):X}");
+        var voxel = _manager.Query.FindNearestVolumeVoxel(position);
+        if (_tree.LeafNode($"{tag} voxel: {voxel:X}###{tag}voxel").SelectedOrHovered && voxel != VoxelMap.InvalidVoxel)
+            _debugVoxelMap?.VisualizeVoxel(voxel);
     }
 
     private void OnNavmeshChanged(Navmesh? navmesh, NavmeshQuery? query)

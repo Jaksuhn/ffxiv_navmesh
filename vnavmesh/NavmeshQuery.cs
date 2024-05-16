@@ -16,13 +16,14 @@ public class NavmeshQuery
     }
 
     public DtNavMeshQuery MeshQuery;
-    public VoxelPathfind VolumeQuery;
+    public VoxelPathfind? VolumeQuery;
     private IDtQueryFilter _filter = new DtQueryDefaultFilter();
 
     public NavmeshQuery(Navmesh navmesh)
     {
         MeshQuery = new(navmesh.Mesh);
-        VolumeQuery = new(navmesh.Volume);
+        if (navmesh.Volume != null)
+            VolumeQuery = new(navmesh.Volume);
     }
 
     public List<Vector3> PathfindMesh(Vector3 from, Vector3 to, bool useRaycast, bool useStringPulling, CancellationToken cancel)
@@ -73,6 +74,12 @@ public class NavmeshQuery
 
     public List<Vector3> PathfindVolume(Vector3 from, Vector3 to, bool useRaycast, bool useStringPulling, CancellationToken cancel)
     {
+        if (VolumeQuery == null)
+        {
+            Service.Log.Error($"Nav volume was not built");
+            return new();
+        }
+
         var startVoxel = FindNearestVolumeVoxel(from);
         var endVoxel = FindNearestVolumeVoxel(to);
         Service.Log.Debug($"[pathfind] voxel {startVoxel:X} -> {endVoxel:X}");
@@ -118,10 +125,10 @@ public class NavmeshQuery
     // finds the point on the mesh within specified x/z tolerance and with largest Y that is still smaller than p.Y
     public Vector3? FindPointOnFloor(Vector3 p, float halfExtentXZ = 5)
     {
-        var polys = FindIntersectingMeshPolys(p, new(halfExtentXZ, 2048, halfExtentXZ));
+        IEnumerable<long> polys = FindIntersectingMeshPolys(p, new(halfExtentXZ, 2048, halfExtentXZ));
         return polys.Select(poly => FindNearestPointOnMeshPoly(p, poly)).Where(pt => pt != null && pt.Value.Y <= p.Y).MaxBy(pt => pt!.Value.Y);
     }
 
     // returns VoxelMap.InvalidVoxel if not found, otherwise voxel index
-    public ulong FindNearestVolumeVoxel(Vector3 p, float halfExtentXZ = 5, float halfExtentY = 5) => VoxelSearch.FindNearestEmptyVoxel(VolumeQuery.Volume, p, new(halfExtentXZ, halfExtentY, halfExtentXZ));
+    public ulong FindNearestVolumeVoxel(Vector3 p, float halfExtentXZ = 5, float halfExtentY = 5) => VolumeQuery != null ? VoxelSearch.FindNearestEmptyVoxel(VolumeQuery.Volume, p, new(halfExtentXZ, halfExtentY, halfExtentXZ)) : VoxelMap.InvalidVoxel;
 }

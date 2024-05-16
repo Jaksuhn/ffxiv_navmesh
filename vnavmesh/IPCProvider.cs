@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using System.Threading;
 
 namespace Navmesh
 {
@@ -9,18 +10,22 @@ namespace Navmesh
     {
         private List<Action> _disposeActions = new();
 
-        public IPCProvider(NavmeshManager navmeshManager, FollowPath followPath, AsyncMoveRequest move, MainWindow mainWindow)
+        public IPCProvider(NavmeshManager navmeshManager, FollowPath followPath, AsyncMoveRequest move, MainWindow mainWindow, DTRProvider dtr)
         {
             RegisterFunc("Nav.IsReady", () => navmeshManager.Navmesh != null);
             RegisterFunc("Nav.BuildProgress", () => navmeshManager.LoadTaskProgress);
             RegisterFunc("Nav.Reload", () => navmeshManager.Reload(true));
             RegisterFunc("Nav.Rebuild", () => navmeshManager.Reload(false));
             RegisterFunc("Nav.Pathfind", (Vector3 from, Vector3 to, bool fly) => navmeshManager.QueryPath(from, to, fly));
+            RegisterFunc("Nav.PathfindCancelable", (Vector3 from, Vector3 to, bool fly, CancellationToken cancel) => navmeshManager.QueryPath(from, to, fly, cancel));
+            RegisterAction("Nav.PathfindCancelAll", navmeshManager.CancelAllQueries);
+            RegisterFunc("Nav.PathfindInProgress", () => navmeshManager.PathfindInProgress);
+            RegisterFunc("Nav.PathfindNumQueued", () => navmeshManager.NumQueuedPathfindRequests);
             RegisterFunc("Nav.IsAutoLoad", () => navmeshManager.AutoLoad);
             RegisterAction("Nav.SetAutoLoad", (bool v) => navmeshManager.AutoLoad = v);
 
             RegisterFunc("Query.Mesh.NearestPoint", (Vector3 p, float halfExtentXZ, float halfExtentY) => navmeshManager.Query?.FindNearestPointOnMesh(p, halfExtentXZ, halfExtentY));
-            RegisterFunc("Query.Mesh.PointOnFloor", (Vector3 p, float halfExtentXZ) => navmeshManager.Query?.FindPointOnFloor(p, halfExtentXZ));
+            RegisterFunc("Query.Mesh.PointOnFloor", (Vector3 p, bool allowUnlandable, float halfExtentXZ) => navmeshManager.Query?.FindPointOnFloor(p, halfExtentXZ));
 
             RegisterAction("Path.MoveTo", (List<Vector3> waypoints, bool fly) => followPath.Move(waypoints, !fly));
             RegisterAction("Path.Stop", followPath.Stop);
@@ -38,6 +43,9 @@ namespace Navmesh
 
             RegisterFunc("Window.IsOpen", () => mainWindow.IsOpen);
             RegisterAction("Window.SetOpen", (bool v) => mainWindow.IsOpen = v);
+
+            RegisterFunc("DTR.IsShown", () => dtr.ShowDtrBar);
+            RegisterAction("DTR.SetShown", (bool v) => dtr.ShowDtrBar = v);
         }
 
         public void Dispose()
@@ -70,6 +78,13 @@ namespace Navmesh
         private void RegisterFunc<TRet, T1, T2, T3>(string name, Func<T1, T2, T3, TRet> func)
         {
             var p = Service.PluginInterface.GetIpcProvider<T1, T2, T3, TRet>("vnavmesh." + name);
+            p.RegisterFunc(func);
+            _disposeActions.Add(p.UnregisterFunc);
+        }
+
+        private void RegisterFunc<TRet, T1, T2, T3, T4>(string name, Func<T1, T2, T3, T4, TRet> func)
+        {
+            var p = Service.PluginInterface.GetIpcProvider<T1, T2, T3, T4, TRet>("vnavmesh." + name);
             p.RegisterFunc(func);
             _disposeActions.Add(p.UnregisterFunc);
         }

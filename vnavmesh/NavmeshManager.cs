@@ -20,15 +20,18 @@ public class NavmeshManager : IDisposable
     public NavmeshQuery? Query => _query;
     public float LoadTaskProgress => _loadTask != null ? _loadTaskProgress : -1; // returns negative value if task is not running
     public string CurrentKey => _lastKey;
+    public bool PathfindInProgress => _currentPathfindTask != null;
+    public int NumQueuedPathfindRequests => _queuedPathfindTasks.Count;
 
     private DirectoryInfo _cacheDir;
-    private NavmeshSettings _settings = new();
     private string _lastKey = "";
     private Task<Navmesh>? _loadTask;
     private volatile float _loadTaskProgress;
     private Navmesh? _navmesh;
     private NavmeshQuery? _query;
     private CancellationTokenSource? _queryCancelSource;
+    private List<Task<List<Vector3>>> _queuedPathfindTasks = new(); // will be executed one by one in order after current task completes
+    private Task<List<Vector3>>? _currentPathfindTask;
 
     public NavmeshManager(DirectoryInfo cacheDir)
     {
@@ -53,7 +56,7 @@ public class NavmeshManager : IDisposable
         if (_loadTask != null)
         {
             if (!_loadTask.IsCompleted)
-                return; // async task is still in progress, do nothing; note that we don't want to start multiple concurrent tasks on rapid transitions
+                return; // async mesh load task is still in progress, do nothing; note that we don't want to start multiple concurrent tasks on rapid transitions
 
             Service.Log.Information($"Finishing transition to '{_lastKey}'");
             try
@@ -72,19 +75,38 @@ public class NavmeshManager : IDisposable
         }
 
         var curKey = GetCurrentKey();
-        if (curKey == _lastKey)
-            return; // everything up-to-date
-
-        if (!AutoLoad)
+        if (curKey != _lastKey)
         {
-            if (_lastKey.Length == 0)
-                return; // nothing is loaded, and auto-load is forbidden
-            curKey = ""; // just unload existing mesh
+            // navmesh needs to be reloaded
+            if (!AutoLoad)
+            {
+                if (_lastKey.Length == 0)
+                    return; // nothing is loaded, and auto-load is forbidden
+                curKey = ""; // just unload existing mesh
+            }
+
+            Service.Log.Info($"Starting transition from '{_lastKey}' to '{curKey}'");
+            _lastKey = curKey;
+            Reload(true);
+            return; // mesh load is now in progress
         }
 
-        Service.Log.Info($"Starting transition from '{_lastKey}' to '{curKey}'");
-        _lastKey = curKey;
-        Reload(true);
+        // at this point, we're not loading a mesh
+        if (_query != null)
+        {
+            if (_currentPathfindTask != null && (_currentPathfindTask.IsCompleted || _currentPathfindTask.IsCanceled))
+            {
+                _currentPathfindTask = null;
+            }
+
+            if (_currentPathfindTask == null && _queuedPathfindTasks.Count > 0)
+            {
+                // kick off new pathfind task
+                _currentPathfindTask = _queuedPathfindTasks[0];
+                _queuedPathfindTasks.RemoveAt(0);
+                _currentPathfindTask.Start();
+            }
+        }
     }
 
     public bool Reload(bool allowLoadFromCache)
@@ -107,7 +129,7 @@ public class NavmeshManager : IDisposable
         return true;
     }
 
-    public Task<List<Vector3>>? QueryPath(Vector3 from, Vector3 to, bool flying)
+    public Task<List<Vector3>>? QueryPath(Vector3 from, Vector3 to, bool flying, CancellationToken externalCancel = default)
     {
         var query = _query;
         if (_queryCancelSource == null || query == null)
@@ -116,13 +138,29 @@ public class NavmeshManager : IDisposable
             return null;
         }
 
-        var token = _queryCancelSource.Token;
-        var task = Task.Run(() =>
+        // task can be cancelled either by internal request (i.e. when navmesh is reloaded) or external
+        var combined = CancellationTokenSource.CreateLinkedTokenSource(_queryCancelSource.Token, externalCancel);
+        var task = new Task<List<Vector3>>(() =>
         {
-            token.ThrowIfCancellationRequested();
-            return flying ? query.PathfindVolume(from, to, UseRaycasts, UseStringPulling, token) : query.PathfindMesh(from, to, UseRaycasts, UseStringPulling, token);
+            using var autoDisposeCombined = combined;
+            combined.Token.ThrowIfCancellationRequested();
+            return flying ? query.PathfindVolume(from, to, UseRaycasts, UseStringPulling, combined.Token) : query.PathfindMesh(from, to, UseRaycasts, UseStringPulling, combined.Token);
         });
+        _queuedPathfindTasks.Add(task);
         return task;
+    }
+
+    public void CancelAllQueries()
+    {
+        if (_queryCancelSource == null)
+        {
+            Service.Log.Error($"Can't cancel queries - navmesh is not loaded");
+            return;
+        }
+
+        _queryCancelSource.Cancel(); // this will cancel current and all queued pathfind tasks
+        _queryCancelSource.Dispose();
+        _queryCancelSource = new(); // create new token source for future tasks
     }
 
     // if non-empty string is returned, active layout is ready
@@ -154,8 +192,10 @@ public class NavmeshManager : IDisposable
     private void ClearState()
     {
         _queryCancelSource?.Cancel();
-        //_queryCancelSource?.Dispose(); - i don't think it's safe to call dispose at this point...
+        _queryCancelSource?.Dispose();
         _queryCancelSource = null;
+        _queuedPathfindTasks.Clear();
+        _currentPathfindTask = null;
 
         OnNavmeshChanged?.Invoke(null, null);
         _query = null;
@@ -164,6 +204,8 @@ public class NavmeshManager : IDisposable
 
     private Navmesh BuildNavmesh(SceneDefinition scene, string cacheKey, bool allowLoadFromCache)
     {
+        var customization = NavmeshCustomizationRegistry.ForTerritory(scene.TerritoryID);
+
         // try reading from cache
         var cache = new FileInfo($"{_cacheDir.FullName}/{cacheKey}.navmesh");
         if (allowLoadFromCache && cache.Exists)
@@ -173,7 +215,7 @@ public class NavmeshManager : IDisposable
                 Service.Log.Debug($"Loading cache: {cache.FullName}");
                 using var stream = cache.OpenRead();
                 using var reader = new BinaryReader(stream);
-                return Navmesh.Deserialize(reader, _settings);
+                return Navmesh.Deserialize(reader, customization.Version);
             }
             catch (Exception ex)
             {
@@ -183,7 +225,7 @@ public class NavmeshManager : IDisposable
 
         // cache doesn't exist or can't be used for whatever reason - build navmesh from scratch
         // TODO: we can build multiple tiles concurrently
-        var builder = new NavmeshBuilder(scene, _settings);
+        var builder = new NavmeshBuilder(scene, customization);
         var deltaProgress = 1.0f / (builder.NumTilesX * builder.NumTilesZ);
         for (int z = 0; z < builder.NumTilesZ; ++z)
         {

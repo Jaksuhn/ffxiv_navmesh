@@ -1,5 +1,4 @@
-﻿using DotRecast.Recast;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Numerics;
 
@@ -66,7 +65,7 @@ public class VoxelMap
         public Vector3 BoundsMin { get; init; }
         public Vector3 BoundsMax { get; init; }
         public int Level { get; init; }
-        public ushort[] Contents { get; init; } // high bit unset: empty voxel (TODO: region id in low bits); high bit set: voxel with solid geometry (subvoxel index in lower bits if non-leaf); order is (y,x,z)
+        public ushort[] Contents { get; init; } // high bit unset: empty voxel (TODO: region id in low bits?); high bit set: voxel with solid geometry (VoxelIdMask if leaf, subvoxel index otherwise); order is (y,x,z)
         public List<Tile> Subdivision { get; init; } = new();
 
         public Level LevelDesc => Owner.Levels[Level];
@@ -108,13 +107,14 @@ public class VoxelMap
             {
                 return (EncodeIndex(idx), true); // empty at this level
             }
-            else if (Level + 1 == Owner.Levels.Length)
+            data &= VoxelIdMask;
+            if (data == VoxelIdMask)
             {
                 return (EncodeIndex(idx), false); // occupied leaf
             }
             else
             {
-                var sub = Subdivision[data & VoxelIdMask].FindLeafVoxel(p, false); // guaranteed to be in bounds
+                var sub = Subdivision[data].FindLeafVoxel(p, false); // guaranteed to be in bounds
                 return (EncodeIndex(idx, sub.index), sub.empty);
             }
         }
@@ -135,14 +135,16 @@ public class VoxelMap
                         if ((data & VoxelOccupiedBit) == 0)
                         {
                             yield return (EncodeIndex(idx), true); // empty at this level
+                            continue;
                         }
-                        else if (Level + 1 == Owner.Levels.Length)
+                        data &= VoxelIdMask;
+                        if (data == VoxelIdMask)
                         {
                             yield return(EncodeIndex(idx), false); // occupied leaf
                         }
                         else
                         {
-                            foreach (var sub in Subdivision[data & VoxelIdMask].EnumerateLeafVoxels(bmin, bmax))
+                            foreach (var sub in Subdivision[data].EnumerateLeafVoxels(bmin, bmax))
                                 yield return (EncodeIndex(idx, sub.index), sub.empty);
                         }
                     }
@@ -178,13 +180,13 @@ public class VoxelMap
         return tileIndex;
     }
 
-    public VoxelMap(Vector3 boundsMin, Vector3 boundsMax, NavmeshSettings settings)
+    public VoxelMap(Vector3 boundsMin, Vector3 boundsMax, int[] tilesPerLevel)
     {
-        Levels = new Level[settings.NumTiles.Length];
+        Levels = new Level[tilesPerLevel.Length];
         var levelExtent = boundsMax - boundsMin;
         for (int i = 0; i < Levels.Length; ++i)
         {
-            Levels[i] = new(levelExtent, settings.NumTiles[i]);
+            Levels[i] = new(levelExtent, tilesPerLevel[i]);
             levelExtent = Levels[i].CellSize;
         }
 
@@ -200,14 +202,13 @@ public class VoxelMap
             if (tileIndex == IndexLevelMask)
                 return false; // asking for non-leaf => consider non-empty
 
-            //Service.Log.Debug($"testing {tileIndex} (s={tile.Contents.Length})");
             var data = tile.Contents[tileIndex];
             if ((data & VoxelOccupiedBit) == 0)
                 return true; // found empty voxel
-            if (tile.Level + 1 == Levels.Length)
+            data &= VoxelIdMask;
+            if (data == VoxelIdMask)
                 return false; // found non-empty leaf
-            //Service.Log.Debug($"-> {data:X} (s={tile.Subdivision.Count})");
-            tile = tile.Subdivision[data & VoxelIdMask];
+            tile = tile.Subdivision[data];
         }
     }
 
@@ -226,66 +227,70 @@ public class VoxelMap
             }
 
             var data = tile.Contents[tileIndex];
-            if ((data & VoxelOccupiedBit) == 0 || tile.Level + 1 == Levels.Length)
+            var id = data & VoxelIdMask;
+            if ((data & VoxelOccupiedBit) == 0 || id == VoxelIdMask)
             {
                 var bb = tile.CalculateSubdivisionBounds(Levels[tile.Level].IndexToVoxel(tileIndex));
                 return (bb.min + eps3, bb.max - eps3);
             }
 
-            tile = tile.Subdivision[data & VoxelIdMask];
+            tile = tile.Subdivision[id];
         }
     }
 
-    // TODO: remove, rasterize triangles directly
-    public void AddFromHeightfield(RcHeightfield hf)
+    public void Build(Voxelizer vox, int tx, int tz)
     {
-        float x0 = hf.bmin.X + (hf.borderSize + 0.5f) * hf.cs;
-        float z = hf.bmin.Z + (hf.borderSize + 0.5f) * hf.cs;
-        for (int iz = hf.borderSize; iz < hf.height - hf.borderSize; ++iz)
+        // downsample
+        var voxelizers = new Voxelizer[Levels.Length];
+        voxelizers[Levels.Length - 1] = vox;
+        for (int i = Levels.Length - 1; i > 0; --i)
         {
-            float x = x0;
-            for (int ix = hf.borderSize; ix < hf.width - hf.borderSize; ++ix)
-            {
-                var span = hf.spans[iz * hf.width + ix];
-                while (span != null)
-                {
-                    float y0 = hf.bmin.Y + span.smin * hf.ch;
-                    float y1 = hf.bmin.Y + span.smax * hf.ch;
-                    AddFromHeightfieldSpan(RootTile, x, z, y0, y1);
-                    span = span.next;
-                }
-                x += hf.cs;
-            }
-            z += hf.cs;
+            ref var l = ref Levels[i];
+            voxelizers[i - 1] = voxelizers[i].Downsample(l.NumCellsX, l.NumCellsY, l.NumCellsZ);
+        }
+
+        // subdivide L0
+        var ny = Levels[0].NumCellsY;
+        var idx = Levels[0].VoxelToIndex(tx, 0, tz);
+        for (int ty = 0; ty < ny; ++ty, ++idx)
+        {
+            BuildTile(RootTile, idx, 0, ty, 0, voxelizers);
         }
     }
 
-    private void AddFromHeightfieldSpan(Tile tile, float x, float z, float y0, float y1)
+    private void BuildTile(Tile parent, ushort index, int x0, int y0, int z0, Span<Voxelizer> source)
     {
-        var ld = tile.LevelDesc;
-        var v0 = tile.WorldToVoxel(new(x, y0, z));
-        if (v0.x >= 0 && v0.x < ld.NumCellsX && v0.z >= 0 && v0.z < ld.NumCellsZ)
+        var (solid, empty) = source[0].Get(x0, y0, z0);
+        if (!solid)
         {
-            var vy0 = Math.Max(0, v0.y);
-            var vy1 = Math.Min(ld.NumCellsY, (int)Math.Ceiling((y1 - tile.BoundsMin.Y) * ld.InvCellSize.Y));
-            for (int vy = vy0; vy < vy1; ++vy)
+            // fully empty => nothing to do
+        }
+        else if (!empty)
+        {
+            // fully solid
+            parent.Contents[index] = VoxelOccupiedBit | VoxelIdMask;
+        }
+        else
+        {
+            parent.Contents[index] = (ushort)(VoxelOccupiedBit | parent.Subdivision.Count);
+            var (min, max) = parent.CalculateSubdivisionBounds(parent.LevelDesc.IndexToVoxel(index));
+            var tile = new Tile(this, min, max, parent.Level + 1);
+            parent.Subdivision.Add(tile);
+
+            // subdivide
+            ref var l = ref Levels[tile.Level];
+            int xOff = x0 * l.NumCellsX;
+            int yOff = y0 * l.NumCellsY;
+            int zOff = z0 * l.NumCellsZ;
+            ushort i = 0;
+            for (int z = 0; z < l.NumCellsZ; ++z)
             {
-                ref ushort voxel = ref tile.Contents[ld.VoxelToIndex(v0.x, vy, v0.z)];
-                if (tile.Level + 1 == Levels.Length)
+                for (int x = 0; x < l.NumCellsX; ++x)
                 {
-                    // last level, just mark voxel as non-empty
-                    voxel = VoxelOccupiedBit;
-                }
-                else
-                {
-                    // create subdivision if not already done, then rasterize inside it
-                    if (voxel == 0)
+                    for (int y = 0; y < l.NumCellsY; ++y, ++i)
                     {
-                        voxel = (ushort)(VoxelOccupiedBit | tile.Subdivision.Count);
-                        var (bmin, bmax) = tile.CalculateSubdivisionBounds(v0.x, vy, v0.z);
-                        tile.Subdivision.Add(new(this, bmin, bmax, tile.Level + 1));
+                        BuildTile(tile, i, xOff + x, yOff + y, zOff + z, source.Slice(1));
                     }
-                    AddFromHeightfieldSpan(tile.Subdivision[voxel & VoxelIdMask], x, z, y0, y1);
                 }
             }
         }
