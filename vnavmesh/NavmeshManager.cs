@@ -12,7 +12,6 @@ namespace Navmesh;
 // manager that loads navmesh matching current zone and performs async pathfinding queries
 public class NavmeshManager : IDisposable
 {
-    public bool AutoLoad = true; // whether we load/build mesh automatically when changing zone
     public bool UseRaycasts = true;
     public bool UseStringPulling = true;
     public event Action<Navmesh?, NavmeshQuery?>? OnNavmeshChanged;
@@ -78,7 +77,7 @@ public class NavmeshManager : IDisposable
         if (curKey != _lastKey)
         {
             // navmesh needs to be reloaded
-            if (!AutoLoad)
+            if (!Service.Config.AutoLoadNavmesh)
             {
                 if (_lastKey.Length == 0)
                     return; // nothing is loaded, and auto-load is forbidden
@@ -170,23 +169,20 @@ public class NavmeshManager : IDisposable
         if (layout == null || layout->InitState != 7 || layout->FestivalStatus is > 0 and < 5)
             return ""; // layout not ready
 
-        var terrRow = Service.LuminaRow<Lumina.Excel.GeneratedSheets.TerritoryType>(layout->TerritoryTypeId);
-        if (terrRow == null)
-            return ""; // layout doesn't belong to a valid zone
-
         var filter = LayoutUtils.FindFilter(layout);
         var filterKey = filter != null ? filter->Key : 0;
-        return $"{terrRow.Bg}//{filterKey:X}//{layout->ActiveFestivals[0]:X}.{layout->ActiveFestivals[1]:X}.{layout->ActiveFestivals[2]:X}.{layout->ActiveFestivals[3]:X}";
+        var terrRow = Service.LuminaRow<Lumina.Excel.GeneratedSheets.TerritoryType>(filter != null ? filter->TerritoryTypeId : layout->TerritoryTypeId);
+        return $"{terrRow?.Bg}//{filterKey:X}//{layout->ActiveFestivals[0]:X}.{layout->ActiveFestivals[1]:X}.{layout->ActiveFestivals[2]:X}.{layout->ActiveFestivals[3]:X}";
     }
 
     private unsafe string GetCacheKey(SceneDefinition scene)
     {
         // note: festivals are active globally, but majority of zones don't have festival-specific layers, so we only want real ones in the cache key
         var layout = LayoutWorld.Instance()->ActiveLayout;
-        var terrRow = Service.LuminaRow<Lumina.Excel.GeneratedSheets.TerritoryType>(layout->TerritoryTypeId)!;
         var filter = LayoutUtils.FindFilter(layout);
         var filterKey = filter != null ? filter->Key : 0;
-        return $"{terrRow.Bg.ToString().Replace('/', '_')}__{filterKey:X}__{string.Join('.', scene.FestivalLayers.Select(id => id.ToString("X")))}";
+        var terrRow = Service.LuminaRow<Lumina.Excel.GeneratedSheets.TerritoryType>(filter != null ? filter->TerritoryTypeId : layout->TerritoryTypeId);
+        return $"{terrRow?.Bg.ToString().Replace('/', '_')}__{filterKey:X}__{string.Join('.', scene.FestivalLayers.Select(id => id.ToString("X")))}";
     }
 
     private void ClearState()
